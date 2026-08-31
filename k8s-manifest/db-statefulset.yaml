@@ -6,15 +6,16 @@
 #     will both match the "db" Service selector:
 #       kubectl delete deployment db -n votting-app
 ---
-# Headless Service: gives the StatefulSet pod a stable DNS identity
-# (db-0.db-headless.votting-app.svc.cluster.local).
-# The app keeps using the existing "db" ClusterIP Service, so no app change.
+# Headless Service named "db" — this is the only Service the database needs.
+# It serves both roles at once:
+#   - the app connects to the hostname "db", exactly as before
+#   - the StatefulSet gets stable per-pod DNS (db-0.db.<ns>.svc.cluster.local)
 apiVersion: v1
 kind: Service
 metadata:
   labels:
     app: db
-  name: db-headless
+  name: db
 spec:
   clusterIP: None
   selector:
@@ -31,7 +32,7 @@ metadata:
     app: db
   name: db
 spec:
-  serviceName: db-headless
+  serviceName: db
   replicas: 1
   selector:
     matchLabels:
