@@ -20,7 +20,7 @@ env:
   ACR_LOGIN_SERVER: vottingapp01.azurecr.io   # your ACR login server
   RESOURCE_GROUP: Nitor-Internal-POC          # resource group containing the AKS cluster
   CLUSTER_NAME: nitor-dev-aks                 # AKS cluster name
-  NAMESPACE: votting-app                      # namespace to deploy into
+  NAMESPACE: votting-app-2                      # namespace to deploy into
 
 jobs:
   deploy:
@@ -64,19 +64,82 @@ jobs:
         run: |
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
+      # Postgres credentials live only in this Secret — never in the manifests,
+      # never in the image. POSTGRES_PASSWORD falls back to "postgres" so a POC
+      # cluster still comes up, but set the repo secret for anything real.
+      - name: Create database credentials secret
+        env:
+          DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          set -euo pipefail
+          DB_USER=postgres
+          DB_PASSWORD="${DB_PASSWORD:-postgres}"
+          if [ "$DB_PASSWORD" = "postgres" ]; then
+            echo "::warning::POSTGRES_PASSWORD repo secret is not set; falling back to the default password."
+          fi
+          kubectl create secret generic db-credentials \
+            --namespace "$NAMESPACE" \
+            --from-literal=username="$DB_USER" \
+            --from-literal=password="$DB_PASSWORD" \
+            --from-literal=database-url="postgres://${DB_USER}:${DB_PASSWORD}@db/postgres" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
       # The AKS kubelet identity has no AcrPull role on the registry, so pods
       # authenticate with a pull-only ACR token instead (scope map
       # "votting-app-pull", read-only on vote/result/worker).
-      # Requires repo secret ACR_PULL_TOKEN_PASSWORD.
-      # Recreated every run so a fresh namespace or a rotated token still works.
-      - name: Create ACR pull secret
+      #
+      # This step is deliberately self-healing and non-destructive:
+      #   - if the in-cluster secret already authenticates, leave it alone
+      #   - otherwise fall back to ACR_PULL_TOKEN_PASSWORD, but only after
+      #     checking that ACR actually accepts it
+      # It never overwrites a working secret with an unverified value, which is
+      # what previously broke image pulls for every newly created pod.
+      - name: Ensure ACR pull secret is valid
+        env:
+          TOKEN_PASSWORD: ${{ secrets.ACR_PULL_TOKEN_PASSWORD }}
         run: |
+          set -euo pipefail
+
+          acr_accepts() {
+            local pw="$1" code
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -u "votting-app-pull-token:${pw}" \
+              "https://${ACR_LOGIN_SERVER}/oauth2/token?scope=repository%3Avote%3Apull&service=${ACR_LOGIN_SERVER}")
+            [ "$code" = "200" ]
+          }
+
+          # What is already in the cluster?
+          existing=$(kubectl get secret acr-pull-secret -n "$NAMESPACE" \
+            -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null || true)
+
+          if [ -n "$existing" ]; then
+            current=$(printf '%s' "$existing" | base64 -d \
+              | jq -r --arg s "$ACR_LOGIN_SERVER" '.auths[$s].password // empty')
+            if [ -n "$current" ] && acr_accepts "$current"; then
+              echo "acr-pull-secret already authenticates against ACR. Leaving it untouched."
+              exit 0
+            fi
+          fi
+
+          echo "No working acr-pull-secret in namespace $NAMESPACE."
+
+          if [ -z "${TOKEN_PASSWORD:-}" ]; then
+            echo "::error::Cluster has no valid pull secret and repo secret ACR_PULL_TOKEN_PASSWORD is not set. Set it, or create the secret manually (see RUNBOOK.md section 5)."
+            exit 1
+          fi
+
+          if ! acr_accepts "$TOKEN_PASSWORD"; then
+            echo "::error::ACR rejected ACR_PULL_TOKEN_PASSWORD. Fix the repo secret or rotate the token (see RUNBOOK.md section 8). Nothing was written to the cluster."
+            exit 1
+          fi
+
           kubectl create secret docker-registry acr-pull-secret \
             --namespace "$NAMESPACE" \
             --docker-server="$ACR_LOGIN_SERVER" \
             --docker-username=votting-app-pull-token \
-            --docker-password="${{ secrets.ACR_PULL_TOKEN_PASSWORD }}" \
+            --docker-password="$TOKEN_PASSWORD" \
             --dry-run=client -o yaml | kubectl apply -f -
+          echo "acr-pull-secret created from ACR_PULL_TOKEN_PASSWORD (verified against ACR)."
 
       - name: Apply manifests
         run: kubectl apply -f k8s-manifest/ -n "$NAMESPACE"

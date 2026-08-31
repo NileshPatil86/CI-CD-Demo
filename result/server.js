@@ -17,8 +17,10 @@ io.on('connection', function (socket) {
   });
 });
 
+// Credentials come from the environment (Kubernetes Secret) when set.
+// The default keeps local docker-compose working unchanged.
 var pool = new Pool({
-  connectionString: 'postgres://postgres:postgres@db/postgres'
+  connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@db/postgres'
 });
 
 async.retry(

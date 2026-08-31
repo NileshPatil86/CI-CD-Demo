@@ -1,0 +1,89 @@
+# Redis as a StatefulSet with a real persistent disk.
+# Replaces redis-deployment.yaml, which used emptyDir — any vote sitting in
+# the queue when the pod restarted was silently dropped.
+#
+# ⚠️  Delete the old Deployment before applying this, or two Redis pods
+#     will both match the "redis" Service selector:
+#       kubectl delete deployment redis -n votting-app
+---
+# Headless Service: gives the StatefulSet pod a stable DNS identity
+# (redis-0.redis-headless.votting-app.svc.cluster.local).
+# The app keeps using the existing "redis" ClusterIP Service, so no app change.
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: redis
+  name: redis-headless
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: redis
+  name: redis
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - image: redis:alpine
+        name: redis
+        # Append-only file. The image's default RDB snapshots can lose up to
+        # 60 seconds of writes; AOF fsyncs every second instead, so a restart
+        # drops at most a second of queued votes.
+        args: ["--appendonly", "yes"]
+        ports:
+        - containerPort: 6379
+          name: redis
+        volumeMounts:
+        - mountPath: /data
+          name: redis-data
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 384Mi
+  # Each replica gets its own Azure Disk. The PVC survives pod restarts,
+  # rescheduling, and deletion of the StatefulSet itself.
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: managed-csi
+      resources:
+        requests:
+          storage: 4Gi

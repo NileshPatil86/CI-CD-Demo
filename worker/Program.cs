@@ -12,12 +12,28 @@ namespace Worker
 {
     public class Program
     {
+        // Read connection details from the environment so credentials come from
+        // a Kubernetes Secret rather than being compiled into the image.
+        // Defaults keep local docker-compose working unchanged.
+        private static string DbConnectionString =>
+            $"Server={Env("DB_HOST", "db")};" +
+            $"Username={Env("DB_USER", "postgres")};" +
+            $"Password={Env("DB_PASSWORD", "postgres")};";
+
+        private static string RedisHost => Env("REDIS_HOST", "redis");
+
+        private static string Env(string name, string fallback)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            return string.IsNullOrEmpty(value) ? fallback : value;
+        }
+
         public static int Main(string[] args)
         {
             try
             {
-                var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
-                var redisConn = OpenRedisConnection("redis");
+                var pgsql = OpenDbConnection(DbConnectionString);
+                var redisConn = OpenRedisConnection(RedisHost);
                 var redis = redisConn.GetDatabase();
 
                 // Keep alive is not implemented in Npgsql yet. This workaround was recommended:
@@ -34,7 +50,7 @@ namespace Worker
                     // Reconnect redis if down
                     if (redisConn == null || !redisConn.IsConnected) {
                         Console.WriteLine("Reconnecting Redis");
-                        redisConn = OpenRedisConnection("redis");
+                        redisConn = OpenRedisConnection(RedisHost);
                         redis = redisConn.GetDatabase();
                     }
                     string json = redis.ListLeftPopAsync("votes").Result;
@@ -46,7 +62,7 @@ namespace Worker
                         if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
                         {
                             Console.WriteLine("Reconnecting DB");
-                            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+                            pgsql = OpenDbConnection(DbConnectionString);
                         }
                         else
                         { // Normal +1 vote requested

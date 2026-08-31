@@ -21,6 +21,14 @@ spec:
       containers:
       - image: vottingapp01.azurecr.io/result:latest
         name: result
+        env:
+        # Full libpq URL, assembled from the Secret so no credential is
+        # written into this manifest.
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: database-url
         ports:
         - containerPort: 80
           name: result

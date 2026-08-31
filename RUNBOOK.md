@@ -116,10 +116,18 @@ Steps in order:
 3. Install kubectl
 4. Rewrite the image tag in the three deployment manifests to the chosen tag
 5. Create the namespace if missing
-6. Create/refresh the `acr-pull-secret` pull secret
+6. Ensure the `acr-pull-secret` pull secret is valid (see below)
 7. `kubectl apply -f k8s-manifest/`
 8. Wait for all five rollouts
 9. Print final `deploy,svc,pods`
+
+**Step 6 is self-healing and non-destructive.** It behaves like this:
+
+- If the secret already in the cluster authenticates against ACR → **leave it untouched**, whatever `ACR_PULL_TOKEN_PASSWORD` says.
+- If there is no working secret → fall back to `ACR_PULL_TOKEN_PASSWORD`, but only write it after confirming ACR accepts it.
+- If neither works → **fail the deploy without writing anything.**
+
+This matters: an earlier version overwrote the secret on every run, so one wrong GitHub secret silently broke image pulls for every newly created pod. The current version cannot do that.
 
 ### Required GitHub repo secrets
 
@@ -128,7 +136,7 @@ Steps in order:
 | `AZURE_CLIENT_ID` | OIDC federated login |
 | `AZURE_TENANT_ID` | OIDC federated login |
 | `AZURE_SUBSCRIPTION_ID` | OIDC federated login |
-| `ACR_PULL_TOKEN_PASSWORD` | Password for the ACR pull token |
+| `ACR_PULL_TOKEN_PASSWORD` | Fallback password for the ACR pull token. Only used when the cluster has no working pull secret — e.g. a brand new namespace. |
 
 ---
 
@@ -146,11 +154,20 @@ imagePullSecrets:
 - name: acr-pull-secret
 ```
 
-> **The better fix:** ask a subscription Owner or User Access Administrator to grant `AcrPull` to the kubelet identity. That removes the token, the GitHub secret, the workflow step, and this entire failure mode.
+> **The permanent fix — needs an admin.** Grant `AcrPull` to the kubelet identity. That removes the token, the GitHub secret, the workflow step, and this entire class of failure.
 >
 > ```
 > az aks update -g Nitor-Internal-POC -n nitor-dev-aks --attach-acr vottingapp01
 > ```
+>
+> A **Contributor cannot do this.** Creating a role assignment needs `Microsoft.Authorization/roleAssignments/write`, which only Owner or User Access Administrator holds. Attempting it as a Contributor fails with:
+>
+> ```
+> (AuthorizationFailed) ... does not have authorization to perform action
+> 'Microsoft.Authorization/roleAssignments/write' over scope ...
+> ```
+>
+> Kubelet identity object ID to hand the admin: `66aee99c-0e2b-4aaa-92fb-13e3e0cb9d46`
 
 ---
 
