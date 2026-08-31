@@ -43,6 +43,12 @@ spec:
         app: redis
     spec:
       terminationGracePeriodSeconds: 30
+      # The redis:alpine entrypoint drops to uid/gid 999, but a freshly
+      # provisioned Azure Disk mounts root-owned. Without fsGroup, Redis cannot
+      # create appendonlydir in /data and exits with "Permission denied".
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
       containers:
       - image: redis:alpine
         name: redis
