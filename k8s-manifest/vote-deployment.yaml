@@ -14,6 +14,10 @@ spec:
       labels:
         app: vote
     spec:
+      # Pull-only ACR token (scope map: votting-app-pull).
+      # Secret is created by the deploy workflow / see README notes.
+      imagePullSecrets:
+      - name: acr-pull-secret
       containers:
       - image: vottingapp01.azurecr.io/vote:latest
         name: vote

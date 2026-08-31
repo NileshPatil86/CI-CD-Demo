@@ -47,16 +47,15 @@ jobs:
         with:
           version: 'latest'
 
-      # The manifests ship with the public dockersamples images. Point them at
-      # our ACR images + the chosen tag before applying. db and redis keep
-      # their public images (postgres / redis) untouched.
-      - name: Point manifests at our ACR images
+      # The manifests pin ":latest". Rewrite just the tag so a run can deploy a
+      # specific SHA. db and redis keep their public images (postgres / redis).
+      - name: Point manifests at the chosen tag
         run: |
           TAG="${{ inputs.image_tag }}"
           cd k8s-manifest
-          sed -i "s|image: dockersamples/examplevotingapp_vote|image: ${ACR_LOGIN_SERVER}/vote:${TAG}|"     vote-deployment.yaml
-          sed -i "s|image: dockersamples/examplevotingapp_result|image: ${ACR_LOGIN_SERVER}/result:${TAG}|" result-deployment.yaml
-          sed -i "s|image: dockersamples/examplevotingapp_worker|image: ${ACR_LOGIN_SERVER}/worker:${TAG}|" worker-deployment.yaml
+          for svc in vote result worker; do
+            sed -i "s|image: ${ACR_LOGIN_SERVER}/${svc}:.*|image: ${ACR_LOGIN_SERVER}/${svc}:${TAG}|" "${svc}-deployment.yaml"
+          done
           echo "--- images to be deployed ---"
           grep -h "image:" *.yaml
 
@@ -64,6 +63,20 @@ jobs:
       - name: Ensure namespace exists
         run: |
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      # The AKS kubelet identity has no AcrPull role on the registry, so pods
+      # authenticate with a pull-only ACR token instead (scope map
+      # "votting-app-pull", read-only on vote/result/worker).
+      # Requires repo secret ACR_PULL_TOKEN_PASSWORD.
+      # Recreated every run so a fresh namespace or a rotated token still works.
+      - name: Create ACR pull secret
+        run: |
+          kubectl create secret docker-registry acr-pull-secret \
+            --namespace "$NAMESPACE" \
+            --docker-server="$ACR_LOGIN_SERVER" \
+            --docker-username=votting-app-pull-token \
+            --docker-password="${{ secrets.ACR_PULL_TOKEN_PASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Apply manifests
         run: kubectl apply -f k8s-manifest/ -n "$NAMESPACE"
