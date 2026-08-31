@@ -1,0 +1,171 @@
+name: Build, Push, and Deploy to AKS
+
+# --------------------------------------------------------------------------
+# Trigger: runs on every push to main, or manually via the Actions tab.
+# Adjust branches / paths-filters as needed.
+# --------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Required for OIDC federated login to Azure (azure/login@v2).
+permissions:
+  id-token: write
+  contents: read
+
+# --------------------------------------------------------------------------
+# ⚙️  EDIT THESE to match your environment
+# --------------------------------------------------------------------------
+env:
+  ACR_LOGIN_SERVER: vottingapp01.azurecr.io   # your ACR login server (Azure Container Registry)
+  RESOURCE_GROUP: Nitor-Internal-POC          # resource group containing the AKS cluster
+  CLUSTER_NAME: nitor-dev-aks                 # AKS cluster name
+  NAMESPACE: votting-app                      # Kubernetes namespace to deploy into
+
+jobs:
+  # ==========================================================================
+  # JOB 1 — Build all three images and push them to ACR
+  #
+  # One matrix leg per app folder. Each leg builds <folder>/Dockerfile with
+  # <folder> as the build context, and pushes to its own ACR repository:
+  #   vottingapp01.azurecr.io/vote:<sha>    + :latest
+  #   vottingapp01.azurecr.io/result:<sha>  + :latest
+  #   vottingapp01.azurecr.io/worker:<sha>  + :latest
+  # Legs run in parallel; fail-fast is off so one broken Dockerfile does not
+  # cancel the other two (easier to debug the first run).
+  # ==========================================================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.vars.outputs.image-tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: vote
+            context: ./vote
+            dockerfile: ./vote/Dockerfile
+            image: vote
+          - name: result
+            context: ./result
+            dockerfile: ./result/Dockerfile
+            image: result
+          - name: worker
+            context: ./worker
+            dockerfile: ./worker/Dockerfile
+            image: worker
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag (git SHA)
+        id: vars
+        run: echo "image-tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # Recommended: OIDC federated login (no long-lived secrets).
+      # Requires AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID secrets
+      # and a federated credential configured on the app registration.
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ steps.vars.outputs.image-tag }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:latest
+          # Scope the GHA layer cache per service, otherwise the three legs
+          # overwrite each other's cache entries.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      # Optional sanity check — pulls the image back down to confirm the
+      # push succeeded and the tag is resolvable before we deploy anything.
+      - name: Pull ${{ matrix.name }} image to verify push
+        run: docker pull ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ steps.vars.outputs.image-tag }}
+
+  # ==========================================================================
+  # JOB 2 — Deploy the newly pushed images to AKS
+  #
+  # ⛔ COMMENTED OUT ON PURPOSE.
+  # Verify JOB 1 pushes all three images to ACR first, then uncomment this
+  # whole block (remove the leading "# " from every line below) and confirm
+  # the DEPLOYMENT_NAME / CONTAINER_NAME values match what is actually in the
+  # cluster:  kubectl get deploy -n votting-app -o wide
+  # ==========================================================================
+  # deploy:
+  #   needs: build-and-push
+  #   runs-on: ubuntu-latest
+  #   environment: production   # optional: ties this job to a GitHub Environment for approvals/secrets
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         # deployment = Deployment object name in the cluster
+  #         # container  = container name inside that Deployment's pod spec
+  #         # image      = ACR repository pushed by JOB 1
+  #         - name: vote
+  #           deployment: vote
+  #           container: vote
+  #           image: vote
+  #         - name: result
+  #           deployment: result
+  #           container: result
+  #           image: result
+  #         - name: worker
+  #           deployment: worker
+  #           container: worker
+  #           image: worker
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Log in to Azure
+  #       uses: azure/login@v2
+  #       with:
+  #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #
+  #     - name: Set AKS context
+  #       uses: azure/aks-set-context@v4
+  #       with:
+  #         resource-group: ${{ env.RESOURCE_GROUP }}
+  #         cluster-name: ${{ env.CLUSTER_NAME }}
+  #
+  #     - name: Set up kubectl
+  #       uses: azure/setup-kubectl@v4
+  #       with:
+  #         version: 'latest'
+  #
+  #     # Option A (used below): update the image on an existing Deployment.
+  #     # Option B (if you keep manifests in repo, e.g. k8s/deployment.yaml):
+  #     #   - run: |
+  #     #       sed -i "s|IMAGE_PLACEHOLDER|${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ needs.build-and-push.outputs.image-tag }}|g" k8s/${{ matrix.name }}.yaml
+  #     #       kubectl apply -f k8s/ -n ${{ env.NAMESPACE }}
+  #     - name: Deploy ${{ matrix.name }} to AKS
+  #       run: |
+  #         kubectl set image deployment/${{ matrix.deployment }} \
+  #           ${{ matrix.container }}=${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ needs.build-and-push.outputs.image-tag }} \
+  #           -n ${{ env.NAMESPACE }}
+  #
+  #     - name: Wait for ${{ matrix.name }} rollout to complete
+  #       run: |
+  #         kubectl rollout status deployment/${{ matrix.deployment }} \
+  #           -n ${{ env.NAMESPACE }} \
+  #           --timeout=180s
