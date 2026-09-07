@@ -19,7 +19,7 @@ spec:
       imagePullSecrets:
       - name: acr-pull-secret
       containers:
-      - image: vottingapp01.azurecr.io/result:latest
+      - image: acrnitordevpoc.azurecr.io/result:latest
         name: result
         env:
         # Full libpq URL, assembled from the Secret so no credential is

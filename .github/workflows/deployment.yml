@@ -17,10 +17,10 @@ permissions:
   contents: read
 
 env:
-  ACR_LOGIN_SERVER: vottingapp01.azurecr.io   # your ACR login server
+  ACR_LOGIN_SERVER: acrnitordevpoc.azurecr.io   # your ACR login server
   RESOURCE_GROUP: Nitor-Internal-POC          # resource group containing the AKS cluster
   CLUSTER_NAME: nitor-dev-aks                 # AKS cluster name
-  NAMESPACE: votting-app-2                      # namespace to deploy into
+  NAMESPACE: nitor-poc                      # namespace to deploy into
 
 jobs:
   deploy:

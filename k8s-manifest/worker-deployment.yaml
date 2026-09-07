@@ -19,7 +19,7 @@ spec:
       imagePullSecrets:
       - name: acr-pull-secret
       containers:
-      - image: vottingapp01.azurecr.io/worker:latest
+      - image: acrnitordevpoc.azurecr.io/worker:latest
         name: worker
         env:
         - name: DB_HOST
