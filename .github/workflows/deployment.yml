@@ -94,26 +94,26 @@ jobs:
             --from-literal=database-url="postgres://${DB_USER}:${DB_PASSWORD}@db/postgres" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # The AKS kubelet identity has no AcrPull role on the registry, so pods
-      # authenticate with a pull-only ACR token instead (scope map
-      # "votting-app-pull", read-only on vote/result/worker).
+      # The AKS kubelet identity has no AcrPull role on the registry (the
+      # Terraform pipeline SP cannot create role assignments), so pods
+      # authenticate with the registry admin credentials instead. The job is
+      # already logged in to Azure, so we read them at runtime with
+      # `az acr credential show` - no repo secret to keep in sync.
       #
-      # This step is deliberately self-healing and non-destructive:
+      # This step is self-healing and non-destructive:
       #   - if the in-cluster secret already authenticates, leave it alone
-      #   - otherwise fall back to ACR_PULL_TOKEN_PASSWORD, but only after
-      #     checking that ACR actually accepts it
-      # It never overwrites a working secret with an unverified value, which is
-      # what previously broke image pulls for every newly created pod.
+      #   - otherwise rebuild it from the current admin password, but only
+      #     after checking ACR actually accepts that password
       - name: Ensure ACR pull secret is valid
-        env:
-          TOKEN_PASSWORD: ${{ secrets.ACR_PULL_TOKEN_PASSWORD }}
         run: |
           set -euo pipefail
 
+          REGISTRY="${ACR_LOGIN_SERVER%%.*}"
+
           acr_accepts() {
-            local pw="$1" code
+            local user="$1" pw="$2" code
             code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -u "votting-app-pull-token:${pw}" \
+              -u "${user}:${pw}" \
               "https://${ACR_LOGIN_SERVER}/oauth2/token?scope=repository%3Avote%3Apull&service=${ACR_LOGIN_SERVER}")
             [ "$code" = "200" ]
           }
@@ -123,33 +123,38 @@ jobs:
             -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null || true)
 
           if [ -n "$existing" ]; then
-            current=$(printf '%s' "$existing" | base64 -d \
+            cur_user=$(printf '%s' "$existing" | base64 -d \
+              | jq -r --arg s "$ACR_LOGIN_SERVER" '.auths[$s].username // empty')
+            cur_pass=$(printf '%s' "$existing" | base64 -d \
               | jq -r --arg s "$ACR_LOGIN_SERVER" '.auths[$s].password // empty')
-            if [ -n "$current" ] && acr_accepts "$current"; then
+            if [ -n "$cur_pass" ] && acr_accepts "$cur_user" "$cur_pass"; then
               echo "acr-pull-secret already authenticates against ACR. Leaving it untouched."
               exit 0
             fi
           fi
 
-          echo "No working acr-pull-secret in namespace $NAMESPACE."
+          echo "No working acr-pull-secret in namespace $NAMESPACE. Rebuilding from admin credentials."
 
-          if [ -z "${TOKEN_PASSWORD:-}" ]; then
-            echo "::error::Cluster has no valid pull secret and repo secret ACR_PULL_TOKEN_PASSWORD is not set. Set it, or create the secret manually (see RUNBOOK.md section 5)."
+          ACR_USER=$(az acr credential show -n "$REGISTRY" --query username -o tsv)
+          ACR_PASS=$(az acr credential show -n "$REGISTRY" --query 'passwords[0].value' -o tsv)
+
+          if [ -z "${ACR_USER:-}" ] || [ -z "${ACR_PASS:-}" ]; then
+            echo "::error::Could not read admin credentials for $REGISTRY. Is the admin user enabled (acr_admin_enabled = true in Terraform)?"
             exit 1
           fi
 
-          if ! acr_accepts "$TOKEN_PASSWORD"; then
-            echo "::error::ACR rejected ACR_PULL_TOKEN_PASSWORD. Fix the repo secret or rotate the token (see RUNBOOK.md section 8). Nothing was written to the cluster."
+          if ! acr_accepts "$ACR_USER" "$ACR_PASS"; then
+            echo "::error::ACR rejected the admin credentials for $REGISTRY. Nothing was written to the cluster."
             exit 1
           fi
 
           kubectl create secret docker-registry acr-pull-secret \
             --namespace "$NAMESPACE" \
             --docker-server="$ACR_LOGIN_SERVER" \
-            --docker-username=votting-app-pull-token \
-            --docker-password="$TOKEN_PASSWORD" \
+            --docker-username="$ACR_USER" \
+            --docker-password="$ACR_PASS" \
             --dry-run=client -o yaml | kubectl apply -f -
-          echo "acr-pull-secret created from ACR_PULL_TOKEN_PASSWORD (verified against ACR)."
+          echo "acr-pull-secret created from admin credentials (verified against ACR)."
 
       - name: Apply manifests
         run: kubectl apply -f k8s-manifest/ -n "$NAMESPACE"
